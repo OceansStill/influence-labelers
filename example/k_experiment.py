@@ -7,6 +7,8 @@ parser.add_argument('--dataset', '-d', type = str, default = 'mimic', help = 'Da
 parser.add_argument('-k', type = int, default = 10, help = 'Number of iterations to run.')
 parser.add_argument('-s', action='store_true', help = 'Selective labels')
 parser.add_argument('--log', '-l', action='store_true', help = 'Run a logistic regression model (otherwise neural network).')
+parser.add_argument('--model', choices = ['mlp', 'log', 'xgb'], default = 'mlp',
+    help = 'Model family to train: mlp (default), log (logistic regression) or xgb (XGBoost).')
 parser.add_argument('-delta', default = 0.05, type = float, help = 'Control which point to consider from a confience point of view.')
 parser.add_argument('-gamma1', default = 6, type = float, help = 'Threshold on center mass.')
 parser.add_argument('-gamma2', default = 0.95, type = float, help = 'Threshold on opposing.')
@@ -15,7 +17,17 @@ args = parser.parse_args()
 
 print('Script running on {} for {} iterations'.format(args.dataset , args.k))
 
-params = {'layers': [[]] if args.log else [[50] * layer for layer in [1, 2, 3]]}  # If = [] equivalent to a simple logistic regression
+use_log = args.model == 'log' or args.log
+use_xgb = args.model == 'xgb'
+model_class = BinaryXGB if use_xgb else BinaryMLP
+params = {'layers': [[]] if use_log else [[50] * layer for layer in [1, 2, 3]]} if not use_xgb else {
+    'n_estimators': [200],
+    'max_depth': [3, 5],
+    'learning_rate': [0.05, 0.1],
+    'subsample': [0.8, 1.0],
+    'colsample_bytree': [0.8, 1.0],
+    'eval_metric': ['logloss']
+}
 l1_penalties = [0.001, 0.01, 0.1, 1., 10., 100., 1000., 10000.]
 tau = 1.0  # Balance between observed and expert labels
 
@@ -34,7 +46,9 @@ selective = args.s
 
 # Create results folder
 import os
-path_results = '../results/{}_{}_delta={}_gamma1={}_gamma2={}_gamma3={}{}/'.format(args.dataset, 'log' if args.log else 'mlp', args.delta, args.gamma1, args.gamma2, args.gamma3, '_selective' if selective else '')
+model_name = 'xgb' if use_xgb else ('log' if use_log else 'mlp')
+path_results = '../results/{}_{}_delta={}_gamma1={}_gamma2={}_gamma3={}{}/'.format(
+    args.dataset, model_name, args.delta, args.gamma1, args.gamma2, args.gamma3, '_selective' if selective else '')
 os.makedirs(path_results, exist_ok = True)
 
 # Iterate k times the algorithm
@@ -62,18 +76,18 @@ for k, (train, test) in enumerate(splitter.split(covariates, target, groups)):
 
     # Train on decision
     if not os.path.exists(path_fold + 'f_D.csv'):
-        f_D = BinaryMLP(**params)
+        f_D = model_class(**params)
         f_D = f_D.fit(cov_train, tar_train['D'], nur_train, platt_calibration = True, groups = None if groups is None else groups[train])
         pred_D_test = pd.Series(f_D.predict(cov_test), index = cov_test.index)
         pred_D_test.to_csv(path_fold + 'f_D.csv')
 
     # Proposed Approach
-    if not os.path.exists(path_fold + 'f_A.csv'):
+    if not os.path.exists(path_fold + 'f_A.csv') and not use_xgb:
         ## Fold evaluation of influences
         try:
-            folds, predictions, influence = influence_cv(BinaryMLP, cov_train, tar_train['D'], nur_train, params = params, l1_penalties = l1_penalties, groups = None if groups is None else groups[train])
+            folds, predictions, influence = influence_cv(model_class, cov_train, tar_train['D'], nur_train, params = params, l1_penalties = l1_penalties, groups = None if groups is None else groups[train])
             center_metric, opposing_metric = compute_agreeability(influence, predictions)
-            
+
             ## Amalgamation
             flat_influence = (np.abs(influence) > args.gamma3).sum(0) == 0
             high_conf = (predictions > (1 - args.delta)) | (predictions < args.delta)
@@ -87,7 +101,7 @@ for k, (train, test) in enumerate(splitter.split(covariates, target, groups)):
             index_amalg = ((tar_train['D'] == 1) | high_agr_correct) if selective else tar_train['D'].isin([0, 1])
 
             ## Train model on new labels
-            f_A = BinaryMLP(**params)
+            f_A = model_class(**params)
             f_A = f_A.fit(cov_train[index_amalg], ya[index_amalg], nur_train[index_amalg], groups = None if groups is None else groups[train][index_amalg])
             pd.Series(f_A.predict(cov_test), index = cov_test.index).to_csv(path_fold + 'f_A.csv')
             indicator = pd.Series(False, index = cov_train.index)
@@ -99,7 +113,7 @@ for k, (train, test) in enumerate(splitter.split(covariates, target, groups)):
     # Observed outcome
     if not os.path.exists(path_fold + 'f_Y.csv'):
         index_observed = tar_train['D'] == 1 if selective else tar_train['D'].isin([0, 1])
-        f_Y = BinaryMLP(**params)
+        f_Y = model_class(**params)
         f_Y = f_Y.fit(cov_train[index_observed], tar_train['Y1'][index_observed], nur_train[index_observed], groups = None if groups is None else groups[train][index_observed])
         pred_Y_test = pd.Series(f_Y.predict(cov_test), index = cov_test.index)
         pred_Y_test.to_csv(path_fold + 'f_Y.csv')
@@ -108,11 +122,11 @@ for k, (train, test) in enumerate(splitter.split(covariates, target, groups)):
 
     # Alternatives
     # Hybrid model: initialize rely on humans
-    if not os.path.exists(path_fold + 'f_hyb.csv'):
+    if not os.path.exists(path_fold + 'f_hyb.csv') and not use_xgb:
         pred_hyb = pd.read_csv(path_fold + 'f_D.csv', index_col = [0, 1]).iloc[:, 0]
 
         ## Compute which test points are part of A for test set
-        predictions, influence = influence_estimate(BinaryMLP, cov_train, tar_train['D'], nur_train, cov_test, params = params, l1_penalties = l1_penalties, groups = None if groups is None else groups[train])
+        predictions, influence = influence_estimate(model_class, cov_train, tar_train['D'], nur_train, cov_test, params = params, l1_penalties = l1_penalties, groups = None if groups is None else groups[train])
         center_metric, opposing_metric = compute_agreeability(influence, predictions)
         flat_influence = (np.abs(influence) > args.gamma3).sum(0) == 0
         high_conf = (predictions > (1 - args.delta)) | (predictions < args.delta)
@@ -122,15 +136,15 @@ for k, (train, test) in enumerate(splitter.split(covariates, target, groups)):
         index_observed = tar_train['D'] == 1 if selective else tar_train['D'].isin([0, 1])
 
         ## Retrain a model on non almagamation only and calibrate: Rely on observed
-        f_hyb = BinaryMLP(**params)
+        f_hyb = model_class(**params)
         f_hyb = f_hyb.fit(cov_train[index_observed], tar_train['Y1'][index_observed], nur_train[index_observed], platt_calibration = True, groups = None if groups is None else groups[train][index_observed])
         pred_hyb.loc[~high_agr_correct] = f_hyb.predict(cov_test.loc[~high_agr_correct])
         pred_hyb.to_csv(path_fold + 'f_hyb.csv')
 
     # Ensemble consensus
-    if not os.path.exists(path_fold + 'f_Aens.csv'):
+    if not os.path.exists(path_fold + 'f_Aens.csv') and not use_xgb:
         ## Estimate decisions
-        decisions = ensemble_agreement_cv(BinaryMLP, cov_train, tar_train['D'], nur_train, params = params)
+        decisions = ensemble_agreement_cv(model_class, cov_train, tar_train['D'], nur_train, params = params)
 
         ## Estimate consistency
         predictions = (decisions > 0.5).mean(0) # Take the average of the binarized decisions 
@@ -143,7 +157,7 @@ for k, (train, test) in enumerate(splitter.split(covariates, target, groups)):
         index_amalg = ((tar_train['D'] == 1) | high_agr_correct) if selective else tar_train['D'].isin([0, 1])
 
         ## Train model on new labels
-        f_Aens = BinaryMLP(**params)
+        f_Aens = model_class(**params)
         f_Aens = f_Aens.fit(cov_train[index_amalg], ya_ens[index_amalg], nur_train[index_amalg], groups = None if groups is None else groups[train][index_amalg])
         pd.Series(f_Aens.predict(cov_test), index = cov_test.index).to_csv(path_fold + 'f_Aens.csv')
         indicator = pd.Series(False, index = cov_train.index)
@@ -170,7 +184,7 @@ for k, (train, test) in enumerate(splitter.split(covariates, target, groups)):
     # Weak supervision
     if not os.path.exists(path_fold + 'f_weak.csv'):
         weak_labels = (tar_train['D'] + tar_train['Y1']).fillna(tar_train['D']) / 2
-        f_weak = BinaryMLP(**params)
+        f_weak = model_class(**params)
         f_weak = f_weak.fit(cov_train, weak_labels, nur_train)
         pd.Series(f_weak.predict(cov_test), index = cov_test.index).to_csv(path_fold + 'f_weak.csv')
 
@@ -184,6 +198,6 @@ for k, (train, test) in enumerate(splitter.split(covariates, target, groups)):
         selection = ~label_issues.is_label_issue.values
 
         ## Train on subset
-        f_robust = BinaryMLP(**params)
+        f_robust = model_class(**params)
         f_robust.fit(cov_train.iloc[selection], tar_train['D'].iloc[selection], nur_train)
         pd.Series(f_robust.predict(cov_test), index = cov_test.index).to_csv(path_fold + 'f_robust.csv')
